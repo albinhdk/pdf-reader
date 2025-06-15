@@ -1,7 +1,7 @@
 <template>
-  <div class="pdf-viewer" :class="{ 'dark-mode': isDarkMode }">
+  <div class="pdf-viewer" :class="{ 'dark-mode': isDarkMode }" @mousemove="onMouseMove">
     <!-- 工具栏 -->
-    <div class="toolbar">
+    <div class="toolbar" :class="{ 'toolbar-hidden': !showToolbar }" @mouseenter="onToolbarMouseEnter" @mouseleave="onToolbarMouseLeave">
       <div class="toolbar-left">
         <button @click="openFile" class="btn btn-primary">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -17,7 +17,7 @@
           </svg>
           关闭
         </button>
-        <span v-if="fileName" class="file-name">{{ fileName }}</span>
+        <span v-if="fileName" class="file-name">{{ displayFileName }}</span>
       </div>
       
       <div class="toolbar-center" v-if="pdfDocument">
@@ -290,6 +290,10 @@
         <div class="loading-spinner"></div>
         <h3>正在载入PDF文档...</h3>
         <p>请稍候，正在解析文件内容</p>
+        <div class="loading-tips">
+          <p class="tip-text">💡 加载大文件可能需要较长时间，请耐心等待</p>
+          <p class="tip-text">📋 加载时间取决于文件大小和系统性能</p>
+        </div>
       </div>
       
       <!-- 空状态 -->
@@ -320,7 +324,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, toRaw, markRaw, onUnmounted, computed } from 'vue'
+import { ref, onMounted, nextTick, toRaw, markRaw, onUnmounted, computed, type ComponentPublicInstance } from 'vue'
 import { exists } from '@tauri-apps/plugin-fs'
 import * as pdfjsLib from 'pdfjs-dist'
 import { useRouter } from 'vue-router'
@@ -337,7 +341,6 @@ const currentPage = ref(1)
 const totalPages = ref(0)
 const scale = ref(1.0)
 const fileName = ref('')
-const fullFilePath = ref('')
 const loading = ref(false)
 const pageInput = ref(1)
 
@@ -368,7 +371,18 @@ const isCurrentPageBookmarked = computed(() => {
   return bookmarks.value.some(bookmark => bookmark.pageNum === currentPage.value)
 })
 const currentSearchIndex = ref(-1)
+
+// 显示文件名（从完整路径中提取）
+const displayFileName = computed(() => {
+  if (!fileName.value) return ''
+  return fileName.value.split(/[\\/]/).pop() || fileName.value
+})
 const pageTextCache = ref<Map<number, string>>(new Map())
+
+// 工具栏自动隐藏相关
+const showToolbar = ref(true)
+const toolbarHideTimer = ref<number | null>(null)
+const isMouseOverToolbar = ref(false)
 
 // DOM引用
 const pdfCanvas = ref<HTMLCanvasElement>()
@@ -382,8 +396,8 @@ const openFile = async () => {
     const { invoke } = await import('@tauri-apps/api/core')
     const filePath = await invoke('open_file_dialog')
     
-    if (filePath) {
-      await loadPdf(filePath as string)
+    if (filePath && typeof filePath === 'string') {
+      await loadPdf(filePath)
     }
   } catch (error) {
     console.error('打开文件失败:', error)
@@ -395,7 +409,6 @@ const openFile = async () => {
       const file = (e.target as HTMLInputElement).files?.[0]
       if (file) {
         fileName.value = file.name
-        fullFilePath.value = file.name // 对于HTML5文件选择，使用文件名作为路径
         const arrayBuffer = await file.arrayBuffer()
         await loadPdfFromBuffer(arrayBuffer)
       }
@@ -410,11 +423,9 @@ const loadPdf = async (filePath: string) => {
     loading.value = true
     console.log('开始加载PDF文件，原始路径:', filePath)
     
-    // 保存完整路径和提取文件名
-    fullFilePath.value = filePath
-    fileName.value = filePath.split(/[\/]/).pop() || ''
-    console.log('完整文件路径:', fullFilePath.value)
-    console.log('提取的文件名:', fileName.value)
+    // 保存完整文件路径用于历史记录
+    fileName.value = filePath
+    console.log('保存的完整文件路径:', fileName.value)
     
     // 检查文件是否存在
     try {
@@ -435,37 +446,47 @@ const loadPdf = async (filePath: string) => {
     console.log('调用Tauri API读取文件...')
     
     try {
-      const fileData = await invoke('read_pdf_file', { path: filePath })
-      console.log('文件读取成功，数据大小:', fileData ? (fileData as ArrayBuffer).byteLength : 0)
+      const fileData = await invoke('read_pdf_file', { path: filePath }) as ArrayBuffer
+      console.log('文件读取成功，数据大小:', fileData ? fileData.byteLength : 0)
       
-      if (!fileData || (fileData as ArrayBuffer).byteLength === 0) {
+      if (!fileData || fileData.byteLength === 0) {
         throw new Error('文件数据为空')
       }
       
-      await loadPdfFromBuffer(fileData as ArrayBuffer)
+      await loadPdfFromBuffer(fileData)
     } catch (invokeError) {
       console.error('Tauri API调用失败:', invokeError)
-      const errorMsg = invokeError instanceof Error ? invokeError.message : '未知错误'
-      throw new Error(`文件读取失败: ${errorMsg}`)
+      throw new Error(`文件读取失败: ${(invokeError as Error).message}`)
     }
   } catch (error) {
     console.error('加载PDF失败:', error)
-    if (error instanceof Error) {
-      console.error('错误详情:', error.stack)
-    }
+    console.error('错误详情:', (error as Error).stack)
     const errorMessage = error instanceof Error ? error.message : '未知错误'
+    
+    // 构建用户友好的错误信息
+    let userMessage = `加载PDF文件失败: ${errorMessage}`
+    let suggestions = ''
+    
+    // 根据错误类型提供不同的建议
+    if (errorMessage.includes('内存不足')) {
+      suggestions = '\n\n建议解决方案：\n• 关闭其他应用程序释放内存\n• 重启应用程序\n• 如果文件过大，可尝试使用PDF压缩工具'
+    } else if (errorMessage.includes('较大') || errorMessage.includes('时间')) {
+      suggestions = '\n\n大文件处理提示：\n• 文件正在加载中，请耐心等待\n• 加载时间取决于文件大小和系统性能\n• 建议在加载期间不要进行其他操作'
+    } else if (errorMessage.includes('文件不存在')) {
+      suggestions = '\n\n请检查：\n• 文件路径是否正确\n• 文件是否已被移动或删除\n• 是否有足够的文件访问权限'
+    }
     
     // 使用Tauri的对话框插件显示错误
     try {
       const { message } = await import('@tauri-apps/plugin-dialog')
-      await message(`加载PDF文件失败: ${errorMessage}\n请检查文件路径是否正确: ${filePath}`, {
+      await message(`${userMessage}${suggestions}`, {
         title: '文件加载错误',
         kind: 'error'
       })
     } catch (dialogError) {
       console.error('显示错误对话框失败:', dialogError)
       // 使用浏览器原生alert作为备选
-      alert(`加载PDF文件失败: ${errorMessage}\n请检查文件路径是否正确: ${filePath}`)
+      alert(`${userMessage}${suggestions}`)
     }
   } finally {
     loading.value = false
@@ -478,11 +499,30 @@ const loadPdfFromBuffer = async (buffer: ArrayBuffer) => {
     loading.value = true
     console.log('开始加载PDF，buffer大小:', buffer.byteLength)
     
+    // 检查文件大小限制
+    const fileSizeMB = buffer.byteLength / (1024 * 1024)
+    console.log('PDF文件大小:', fileSizeMB.toFixed(2), 'MB')
+    
+    // 对于超大文件给出警告
+    if (fileSizeMB > 100) {
+      console.warn('警告：文件较大，可能需要较长时间加载或导致内存不足')
+    }
+    
+    // 检查ArrayBuffer大小限制（约2GB在32位系统，8GB在64位系统）
+    const maxSize32bit = Math.pow(2, 31) - 1 // 约2GB
+    if (buffer.byteLength >= maxSize32bit) {
+      throw new Error(`文件过大 (${fileSizeMB.toFixed(2)}MB)，超出系统处理能力。建议使用文件大小小于2GB的PDF文件。`)
+    }
+    
     // 按照官方Demo的方式创建loadingTask
     const loadingTask = pdfjsLib.getDocument({ 
       data: new Uint8Array(buffer),
       cMapUrl: 'https://unpkg.com/pdfjs-dist@5.3.31/cmaps/',
-      cMapPacked: true
+      cMapPacked: true,
+      // 添加大文件优化配置
+      maxImageSize: fileSizeMB > 50 ? 16777216 : -1, // 16MB图片限制
+      disableFontFace: fileSizeMB > 100, // 大文件禁用字体渲染优化
+      useSystemFonts: fileSizeMB > 100
     })
     
     console.log('PDF.js版本:', pdfjsLib.version)
@@ -503,14 +543,40 @@ const loadPdfFromBuffer = async (buffer: ArrayBuffer) => {
     await nextTick()
     await renderPage(1)
     
-    // 默认适应宽度
+    // 默认适应宽度显示
     await fitToWidth()
   } catch (error) {
     console.error('解析PDF失败:', error)
-    if (error instanceof Error) {
-      console.error('错误详情:', error.stack)
+    console.error('错误详情:', (error as Error).stack)
+    
+    const errorMessage = error instanceof Error ? error.message : '未知错误'
+    let userMessage = 'PDF文件解析失败'
+    let suggestions = ''
+    
+    // 根据错误类型提供具体建议
+    if (errorMessage.includes('Invalid PDF') || errorMessage.includes('corrupted')) {
+      suggestions = '\n\n可能原因：\n• 文件已损坏或不是有效的PDF文件\n• 文件下载不完整\n• 文件格式不受支持\n\n建议解决方案：\n• 重新下载或获取文件\n• 尝试用其他PDF阅读器打开\n• 检查文件扩展名是否正确'
+    } else if (errorMessage.includes('password') || errorMessage.includes('encrypted')) {
+      suggestions = '\n\n该PDF文件受密码保护，当前版本暂不支持加密文件。\n\n建议解决方案：\n• 使用其他工具移除密码保护\n• 获取未加密版本的文件'
+    } else if (errorMessage.includes('memory') || errorMessage.includes('out of memory') || errorMessage.includes('Invalid array buffer length') || errorMessage.includes('RangeError')) {
+      suggestions = '\n\n内存不足或文件过大，无法解析此PDF文件。\n\n建议解决方案：\n• 关闭其他应用程序释放内存\n• 重启应用程序\n• 使用PDF压缩工具减小文件大小\n• 尝试分割大文件为多个小文件\n• 在64位系统上运行以获得更大内存支持'
+    } else if (errorMessage.includes('文件过大') || errorMessage.includes('超出系统处理能力')) {
+      suggestions = '\n\n文件大小超出系统限制。\n\n建议解决方案：\n• 使用PDF压缩工具减小文件大小\n• 分割PDF为多个较小的文件\n• 在更高配置的设备上打开\n• 使用专业的PDF处理软件'
+    } else {
+      suggestions = '\n\n请检查：\n• 文件是否为有效的PDF格式\n• 文件是否完整未损坏\n• 文件大小是否过大\n• 尝试重新打开文件'
     }
-    alert('PDF文件解析失败，请检查文件是否损坏')
+    
+    // 使用更友好的错误提示
+    try {
+      const { message } = await import('@tauri-apps/plugin-dialog')
+      await message(`${userMessage}\n\n错误详情: ${errorMessage}${suggestions}`, {
+        title: 'PDF解析错误',
+        kind: 'error'
+      })
+    } catch (dialogError) {
+      console.error('显示错误对话框失败:', dialogError)
+      alert(`${userMessage}\n\n错误详情: ${errorMessage}${suggestions}`)
+    }
   } finally {
     loading.value = false
   }
@@ -573,11 +639,9 @@ const renderPage = async (pageNum: number) => {
     pageInput.value = pageNum
   } catch (error) {
     console.error('渲染页面失败:', error)
-    if (error instanceof Error) {
-      console.error('错误堆栈:', error.stack)
-      console.error('错误名称:', error.name)
-      console.error('错误消息:', error.message)
-    }
+    console.error('错误堆栈:', (error as Error).stack)
+    console.error('错误名称:', (error as Error).name)
+    console.error('错误消息:', (error as Error).message)
   } finally {
     loading.value = false
   }
@@ -593,7 +657,6 @@ const closeCurrentPdf = () => {
   
   // 重置状态
   fileName.value = ''
-  fullFilePath.value = ''
   currentPage.value = 1
   totalPages.value = 0
   pageInput.value = 1
@@ -941,6 +1004,48 @@ const toggleDarkMode = () => {
   localStorage.setItem('pdf-reader-dark-mode', isDarkMode.value.toString())
 }
 
+// ========== 工具栏自动隐藏功能 ==========
+// 显示工具栏
+const showToolbarTemporarily = () => {
+  showToolbar.value = true
+  resetHideTimer()
+}
+
+// 重置隐藏计时器
+const resetHideTimer = () => {
+  if (toolbarHideTimer.value) {
+    clearTimeout(toolbarHideTimer.value)
+  }
+  
+  // 如果鼠标不在工具栏上，3秒后隐藏工具栏
+  if (!isMouseOverToolbar.value) {
+    toolbarHideTimer.value = setTimeout(() => {
+      showToolbar.value = false
+    }, 3000)
+  }
+}
+
+// 鼠标进入工具栏
+const onToolbarMouseEnter = () => {
+  isMouseOverToolbar.value = true
+  showToolbar.value = true
+  if (toolbarHideTimer.value) {
+    clearTimeout(toolbarHideTimer.value)
+    toolbarHideTimer.value = null
+  }
+}
+
+// 鼠标离开工具栏
+const onToolbarMouseLeave = () => {
+  isMouseOverToolbar.value = false
+  resetHideTimer()
+}
+
+// 鼠标移动时显示工具栏
+const onMouseMove = () => {
+  showToolbarTemporarily()
+}
+
 // ========== 缩略图功能 ==========
 // 切换缩略图面板
 const toggleThumbnails = async () => {
@@ -953,9 +1058,9 @@ const toggleThumbnails = async () => {
 }
 
 // 设置缩略图canvas引用
-const setThumbnailRef = (el: any, pageNum: number) => {
-  if (el && el instanceof HTMLCanvasElement) {
-    thumbnailRefs.value.set(pageNum, el)
+const setThumbnailRef = (el: Element | ComponentPublicInstance | null, pageNum: number) => {
+  if (el && 'getContext' in el) {
+    thumbnailRefs.value.set(pageNum, el as HTMLCanvasElement)
   }
 }
 
@@ -1279,6 +1384,9 @@ onMounted(() => {
   
   // 初始化设置
   initializeSettings()
+  
+  // 初始化工具栏自动隐藏
+  resetHideTimer()
 })
 
 // 清理
@@ -1287,6 +1395,12 @@ const cleanup = () => {
   document.removeEventListener('keydown', handleKeydown)
   document.removeEventListener('keyup', handleKeyup)
   document.removeEventListener('wheel', handleWheel)
+  
+  // 清理工具栏自动隐藏计时器
+  if (toolbarHideTimer.value) {
+    clearTimeout(toolbarHideTimer.value)
+    toolbarHideTimer.value = null
+  }
 }
 
 // 初始化设置
@@ -1334,24 +1448,23 @@ const checkPdfToOpen = async () => {
             await renderPage(pdfInfo.currentPage)
             console.log('渲染到指定页面成功:', pdfInfo.currentPage)
           }
+          
+          // 默认适应宽度显示
+          await fitToWidth()
         } catch (loadError) {
           console.error('加载PDF文件失败:', loadError)
-          if (loadError instanceof Error) {
-            console.error('错误详情:', loadError.stack)
-          }
+          console.error('错误详情:', (loadError as Error).stack)
           
           // 使用Tauri的对话框插件显示错误
           try {
             const { message } = await import('@tauri-apps/plugin-dialog')
-            const errorMsg = loadError instanceof Error ? loadError.message : '未知错误'
-            await message(`无法打开文件: ${pdfInfo.filePath}\n\n错误信息: ${errorMsg}`, {
+            await message(`无法打开文件: ${pdfInfo.filePath}\n\n错误信息: ${(loadError as Error).message || '未知错误'}`, {
               title: '文件打开错误',
               kind: 'error'
             })
           } catch (dialogError) {
             console.error('显示错误对话框失败:', dialogError)
-            const errorMsg = loadError instanceof Error ? loadError.message : '未知错误'
-            alert(`无法打开文件: ${pdfInfo.filePath}\n\n错误信息: ${errorMsg}`)
+            alert(`无法打开文件: ${pdfInfo.filePath}\n\n错误信息: ${(loadError as Error).message || '未知错误'}`)
           }
         }
       } else {
@@ -1362,15 +1475,14 @@ const checkPdfToOpen = async () => {
       sessionStorage.removeItem('pdf-to-open')
     } catch (error) {
       console.error('解析PDF信息失败:', error)
-      const errorMsg = error instanceof Error ? error.message : '未知错误'
-      alert('打开历史PDF失败: ' + errorMsg)
+      alert('打开历史PDF失败: ' + ((error as Error).message || '未知错误'))
     }
   }
 }
 
 // 更新阅读历史
 const updateReadingHistory = (pageNum: number) => {
-  if (!pdfDocument.value || !fullFilePath.value) return
+  if (!pdfDocument.value || !fileName.value) return
   
   try {
     // 从本地存储获取现有的阅读历史
@@ -1378,11 +1490,11 @@ const updateReadingHistory = (pageNum: number) => {
     let history = saved ? JSON.parse(saved) : []
     
     // 查找当前文件是否已在历史记录中
-    const filePath = fullFilePath.value
+    const filePath = fileName.value
     const existingIndex = history.findIndex((item: any) => item.filePath === filePath)
     
     const historyItem = {
-      title: fileName.value || filePath.split(/[\/]/).pop() || filePath,
+      title: filePath.split(/[\\/]/).pop() || filePath,
       filePath: filePath,
       currentPage: pageNum,
       totalPages: totalPages.value,
@@ -1429,6 +1541,16 @@ onUnmounted(cleanup)
   background: white;
   border-bottom: 1px solid #e0e0e0;
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  transition: transform 0.3s ease-in-out;
+}
+
+.toolbar-hidden {
+  transform: translateY(-100%);
 }
 
 .toolbar-left,
@@ -1531,6 +1653,7 @@ onUnmounted(cleanup)
   flex: 1;
   overflow: auto;
   padding: 20px;
+  padding-top: 80px; /* 为固定工具栏留出空间 */
   display: flex;
   justify-content: center;
   align-items: flex-start;
@@ -1574,7 +1697,21 @@ onUnmounted(cleanup)
 .loading-state h3 {
   margin: 12px 0 8px 0;
   font-size: 18px;
-  color: #333;
+}
+
+.loading-tips {
+  margin-top: 16px;
+  padding: 12px;
+  background: rgba(0, 123, 255, 0.1);
+  border-radius: 8px;
+  border-left: 3px solid #007bff;
+}
+
+.tip-text {
+  margin: 4px 0;
+  font-size: 13px;
+  color: #555;
+  line-height: 1.4;
 }
 
 .loading-state p {

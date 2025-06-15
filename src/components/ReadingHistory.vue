@@ -149,9 +149,39 @@ const removeHistoryItem = (index: number) => {
 }
 
 // 打开PDF阅读器
-const openPdfViewer = () => {
-  // 使用路由导航到PDF阅读器页面
-  window.location.href = '#/viewer'
+const openPdfViewer = async () => {
+  try {
+    // 使用Tauri的文件对话框直接选择文件
+    const { invoke } = await import('@tauri-apps/api/core')
+    const filePath = await invoke('open_file_dialog')
+    
+    if (filePath) {
+      // 将选中的PDF信息存储到sessionStorage
+      sessionStorage.setItem('pdf-to-open', JSON.stringify({
+        filePath: filePath,
+        currentPage: 1
+      }))
+      
+      console.log('已将PDF信息存储到sessionStorage:', filePath)
+      
+      // 导航到PDF阅读器页面
+      window.location.href = '#/viewer'
+    }
+  } catch (error) {
+    console.error('打开文件对话框失败:', error)
+    // 使用Tauri的对话框插件显示错误
+    try {
+      const { message } = await import('@tauri-apps/plugin-dialog')
+      await message(`无法打开文件选择对话框\n\n错误信息: ${(error as Error).message || '未知错误'}`, {
+        title: '文件选择错误',
+        kind: 'error'
+      })
+    } catch (dialogError) {
+      console.error('显示错误对话框失败:', dialogError)
+      // 使用浏览器原生alert作为备选
+      alert(`无法打开文件选择对话框\n\n错误信息: ${(error as Error).message || '未知错误'}`)
+    }
+  }
 }
 
 // 打开特定的PDF文件
@@ -165,18 +195,12 @@ const openPdf = async (item: ReadingHistoryItem) => {
     
     // 使用Tauri API检查文件是否存在
     
-    try {
-      // 检查文件是否存在
-      const fileExists = await exists(normalizedPath)
-      console.log('文件是否存在:', fileExists, '路径:', normalizedPath)
-      
-      if (!fileExists) {
-        throw new Error(`文件不存在: ${normalizedPath}`)
-      }
-    } catch (fsError) {
-      console.error('文件存在性检查失败:', fsError)
-      // 即使文件检查失败，也尝试继续加载文件
-      console.log('尝试继续打开文件，忽略文件存在性检查错误')
+    // 检查文件是否存在
+    const fileExists = await exists(normalizedPath)
+    console.log('文件是否存在:', fileExists, '路径:', normalizedPath)
+    
+    if (!fileExists) {
+      throw new Error(`文件不存在: ${normalizedPath}`)
     }
     
     // 将选中的PDF信息存储到sessionStorage，以便PDF阅读器组件可以获取
@@ -191,24 +215,22 @@ const openPdf = async (item: ReadingHistoryItem) => {
     window.location.href = '#/viewer'
   } catch (error) {
     console.error('打开PDF文件失败:', error)
-    if (error instanceof Error) {
-      console.error('错误详情:', error.stack)
-    }
+    console.error('错误详情:', (error as Error).stack)
     
+    // 文件打开失败时，保持在历史记录页面，不跳转
     // 使用Tauri的对话框插件显示错误
     try {
       const { message } = await import('@tauri-apps/plugin-dialog')
-      const errorMsg = error instanceof Error ? error.message : '未知错误'
-      await message(`无法打开文件: ${item.filePath}\n\n错误信息: ${errorMsg}`, {
+      await message(`无法打开文件: ${item.filePath}\n\n错误信息: ${(error as Error).message || '未知错误'}\n\n请检查文件是否存在或已被移动。`, {
         title: '文件打开错误',
         kind: 'error'
       })
     } catch (dialogError) {
       console.error('显示错误对话框失败:', dialogError)
       // 使用浏览器原生alert作为备选
-      const errorMsg = error instanceof Error ? error.message : '未知错误'
-      alert(`无法打开文件: ${item.filePath}\n\n错误信息: ${errorMsg}`)
+      alert(`无法打开文件: ${item.filePath}\n\n错误信息: ${(error as Error).message || '未知错误'}\n\n请检查文件是否存在或已被移动。`)
     }
+    // 不执行跳转，保持在当前页面
   }
 }
 
@@ -241,9 +263,42 @@ onMounted(() => {
   max-width: 1200px;
   margin: 0 auto;
   min-height: 100vh;
+  max-height: 100vh;
+  overflow-y: auto;
   background-color: #f5f5f5;
   color: #333;
   transition: background-color 0.3s, color 0.3s;
+}
+
+/* 自定义滚动条样式 */
+.reading-history::-webkit-scrollbar {
+  width: 8px;
+}
+
+.reading-history::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+}
+
+.reading-history::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+}
+
+.reading-history::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.dark-mode .reading-history::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.dark-mode .reading-history::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.dark-mode .reading-history::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.5);
 }
 
 .reading-history.dark-mode {
@@ -296,39 +351,6 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
-  max-height: calc(100vh - 200px);
-  overflow-y: auto;
-  padding-right: 0.5rem;
-}
-
-.history-list::-webkit-scrollbar {
-  width: 8px;
-}
-
-.history-list::-webkit-scrollbar-track {
-  background: #f1f1f1;
-  border-radius: 4px;
-}
-
-.dark-mode .history-list::-webkit-scrollbar-track {
-  background: #333;
-}
-
-.history-list::-webkit-scrollbar-thumb {
-  background: #c1c1c1;
-  border-radius: 4px;
-}
-
-.dark-mode .history-list::-webkit-scrollbar-thumb {
-  background: #666;
-}
-
-.history-list::-webkit-scrollbar-thumb:hover {
-  background: #a8a8a8;
-}
-
-.dark-mode .history-list::-webkit-scrollbar-thumb:hover {
-  background: #777;
 }
 
 .history-item {
