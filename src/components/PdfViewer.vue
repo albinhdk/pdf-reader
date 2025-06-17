@@ -1,7 +1,7 @@
 <template>
-  <div class="pdf-viewer" :class="{ 'dark-mode': isDarkMode }" @mousemove="onMouseMove">
+  <div class="pdf-viewer" :class="{ 'dark-mode': isDarkMode }">
     <!-- 工具栏 -->
-    <div class="toolbar" :class="{ 'toolbar-hidden': !showToolbar }" @mouseenter="onToolbarMouseEnter" @mouseleave="onToolbarMouseLeave">
+    <div class="toolbar" :class="{ 'toolbar-hidden': isToolbarHidden }" @mouseenter="showToolbar" @mouseleave="startHideToolbar">
       <div class="toolbar-left">
         <button @click="openFile" class="btn btn-primary">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -17,7 +17,7 @@
           </svg>
           关闭
         </button>
-        <span v-if="fileName" class="file-name">{{ displayFileName }}</span>
+        <span v-if="fileName" class="file-name">{{ fileName }}</span>
       </div>
       
       <div class="toolbar-center" v-if="pdfDocument">
@@ -284,16 +284,12 @@
     </div>
     
     <!-- PDF内容区域 -->
-    <div class="pdf-content" ref="pdfContainer" :class="{ 'dark-mode': isDarkMode, 'with-sidebar': showThumbnails || showOutline || showBookmarkList }">
+    <div class="pdf-content" ref="pdfContainer" :class="{ 'dark-mode': isDarkMode, 'with-sidebar': showThumbnails || showOutline || showBookmarkList }" @mousemove="showToolbar">
       <!-- 文档载入状态 -->
       <div v-if="loading && !pdfDocument" class="loading-state">
         <div class="loading-spinner"></div>
         <h3>正在载入PDF文档...</h3>
         <p>请稍候，正在解析文件内容</p>
-        <div class="loading-tips">
-          <p class="tip-text">💡 加载大文件可能需要较长时间，请耐心等待</p>
-          <p class="tip-text">📋 加载时间取决于文件大小和系统性能</p>
-        </div>
       </div>
       
       <!-- 空状态 -->
@@ -324,10 +320,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, toRaw, markRaw, onUnmounted, computed, type ComponentPublicInstance } from 'vue'
+import { ref, onMounted, nextTick, toRaw, markRaw, onUnmounted, computed } from 'vue'
 import { exists } from '@tauri-apps/plugin-fs'
 import * as pdfjsLib from 'pdfjs-dist'
 import { useRouter } from 'vue-router'
+import { ChunkedPdfLoader } from '../utils/ChunkedPdfLoader'
 
 // PDF.js worker 配置 - 按照官方文档标准配置
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@5.3.31/build/pdf.worker.min.mjs'
@@ -341,6 +338,7 @@ const currentPage = ref(1)
 const totalPages = ref(0)
 const scale = ref(1.0)
 const fileName = ref('')
+const filePath = ref('') // 保存完整文件路径
 const loading = ref(false)
 const pageInput = ref(1)
 
@@ -351,6 +349,10 @@ const searchResults = ref<Array<{pageNum: number, textIndex: number, text: strin
 
 // 夜间模式
 const isDarkMode = ref(false)
+
+// 工具栏自动隐藏
+const isToolbarHidden = ref(false)
+let toolbarHideTimer: number | null = null
 
 // 侧边栏面板控制
 const showThumbnails = ref(false)
@@ -371,18 +373,7 @@ const isCurrentPageBookmarked = computed(() => {
   return bookmarks.value.some(bookmark => bookmark.pageNum === currentPage.value)
 })
 const currentSearchIndex = ref(-1)
-
-// 显示文件名（从完整路径中提取）
-const displayFileName = computed(() => {
-  if (!fileName.value) return ''
-  return fileName.value.split(/[\\/]/).pop() || fileName.value
-})
 const pageTextCache = ref<Map<number, string>>(new Map())
-
-// 工具栏自动隐藏相关
-const showToolbar = ref(true)
-const toolbarHideTimer = ref<number | null>(null)
-const isMouseOverToolbar = ref(false)
 
 // DOM引用
 const pdfCanvas = ref<HTMLCanvasElement>()
@@ -396,8 +387,8 @@ const openFile = async () => {
     const { invoke } = await import('@tauri-apps/api/core')
     const filePath = await invoke('open_file_dialog')
     
-    if (filePath && typeof filePath === 'string') {
-      await loadPdf(filePath)
+    if (filePath) {
+      await loadPdf(filePath as string)
     }
   } catch (error) {
     console.error('打开文件失败:', error)
@@ -418,22 +409,24 @@ const openFile = async () => {
 }
 
 // 从文件路径加载PDF
-const loadPdf = async (filePath: string) => {
+const loadPdf = async (filePathParam: string) => {
   try {
     loading.value = true
-    console.log('开始加载PDF文件，原始路径:', filePath)
+    console.log('开始加载PDF文件，原始路径:', filePathParam)
     
-    // 保存完整文件路径用于历史记录
-    fileName.value = filePath
-    console.log('保存的完整文件路径:', fileName.value)
+    // 保存完整文件路径和提取文件名
+    filePath.value = filePathParam
+    fileName.value = filePathParam.split(/[\/]/).pop() || ''
+    console.log('保存的完整路径:', filePath.value)
+    console.log('提取的文件名:', fileName.value)
     
     // 检查文件是否存在
     try {
-      const fileExists = await exists(filePath)
-      console.log('文件是否存在检查结果:', fileExists, '路径:', filePath)
+      const fileExists = await exists(filePathParam)
+      console.log('文件是否存在检查结果:', fileExists, '路径:', filePathParam)
       
       if (!fileExists) {
-        throw new Error(`文件不存在: ${filePath}`)
+        throw new Error(`文件不存在: ${filePathParam}`)
       }
     } catch (fsError) {
       console.error('文件存在性检查失败:', fsError)
@@ -441,52 +434,49 @@ const loadPdf = async (filePath: string) => {
       console.log('尝试继续加载文件，忽略文件存在性检查错误')
     }
     
-    // 使用Tauri读取文件
+    // 获取文件信息以决定加载策略
     const { invoke } = await import('@tauri-apps/api/core')
-    console.log('调用Tauri API读取文件...')
+    const [fileSize] = await invoke('get_pdf_file_info', { path: filePathParam }) as [number, string]
+    const fileSizeMB = fileSize / (1024 * 1024)
     
-    try {
-      const fileData = await invoke('read_pdf_file', { path: filePath }) as ArrayBuffer
-      console.log('文件读取成功，数据大小:', fileData ? fileData.byteLength : 0)
-      
-      if (!fileData || fileData.byteLength === 0) {
-        throw new Error('文件数据为空')
+    console.log(`文件大小: ${fileSizeMB.toFixed(2)} MB`)
+    
+    // 对于大文件（>50MB）使用分片加载，小文件使用传统加载
+    if (fileSizeMB > 50) {
+      console.log('使用分片加载模式')
+      await loadPdfFromChunkedLoader(filePathParam)
+    } else {
+      console.log('使用传统加载模式')
+      try {
+        const fileData = await invoke('read_pdf_file', { path: filePathParam })
+        console.log('文件读取成功，数据大小:', fileData ? (fileData as ArrayBuffer).byteLength : 0)
+        
+        if (!fileData || (fileData as ArrayBuffer).byteLength === 0) {
+          throw new Error('文件数据为空')
+        }
+        
+        await loadPdfFromBuffer(fileData as ArrayBuffer)
+      } catch (invokeError) {
+        console.error('传统加载失败，尝试分片加载:', invokeError)
+        await loadPdfFromChunkedLoader(filePathParam)
       }
-      
-      await loadPdfFromBuffer(fileData)
-    } catch (invokeError) {
-      console.error('Tauri API调用失败:', invokeError)
-      throw new Error(`文件读取失败: ${(invokeError as Error).message}`)
     }
   } catch (error) {
     console.error('加载PDF失败:', error)
     console.error('错误详情:', (error as Error).stack)
     const errorMessage = error instanceof Error ? error.message : '未知错误'
     
-    // 构建用户友好的错误信息
-    let userMessage = `加载PDF文件失败: ${errorMessage}`
-    let suggestions = ''
-    
-    // 根据错误类型提供不同的建议
-    if (errorMessage.includes('内存不足')) {
-      suggestions = '\n\n建议解决方案：\n• 关闭其他应用程序释放内存\n• 重启应用程序\n• 如果文件过大，可尝试使用PDF压缩工具'
-    } else if (errorMessage.includes('较大') || errorMessage.includes('时间')) {
-      suggestions = '\n\n大文件处理提示：\n• 文件正在加载中，请耐心等待\n• 加载时间取决于文件大小和系统性能\n• 建议在加载期间不要进行其他操作'
-    } else if (errorMessage.includes('文件不存在')) {
-      suggestions = '\n\n请检查：\n• 文件路径是否正确\n• 文件是否已被移动或删除\n• 是否有足够的文件访问权限'
-    }
-    
     // 使用Tauri的对话框插件显示错误
     try {
       const { message } = await import('@tauri-apps/plugin-dialog')
-      await message(`${userMessage}${suggestions}`, {
+      await message(`加载PDF文件失败: ${errorMessage}\n请检查文件路径是否正确: ${filePath}`, {
         title: '文件加载错误',
         kind: 'error'
       })
     } catch (dialogError) {
       console.error('显示错误对话框失败:', dialogError)
       // 使用浏览器原生alert作为备选
-      alert(`${userMessage}${suggestions}`)
+      alert(`加载PDF文件失败: ${errorMessage}\n请检查文件路径是否正确: ${filePathParam}`)
     }
   } finally {
     loading.value = false
@@ -499,30 +489,11 @@ const loadPdfFromBuffer = async (buffer: ArrayBuffer) => {
     loading.value = true
     console.log('开始加载PDF，buffer大小:', buffer.byteLength)
     
-    // 检查文件大小限制
-    const fileSizeMB = buffer.byteLength / (1024 * 1024)
-    console.log('PDF文件大小:', fileSizeMB.toFixed(2), 'MB')
-    
-    // 对于超大文件给出警告
-    if (fileSizeMB > 100) {
-      console.warn('警告：文件较大，可能需要较长时间加载或导致内存不足')
-    }
-    
-    // 检查ArrayBuffer大小限制（约2GB在32位系统，8GB在64位系统）
-    const maxSize32bit = Math.pow(2, 31) - 1 // 约2GB
-    if (buffer.byteLength >= maxSize32bit) {
-      throw new Error(`文件过大 (${fileSizeMB.toFixed(2)}MB)，超出系统处理能力。建议使用文件大小小于2GB的PDF文件。`)
-    }
-    
     // 按照官方Demo的方式创建loadingTask
     const loadingTask = pdfjsLib.getDocument({ 
       data: new Uint8Array(buffer),
       cMapUrl: 'https://unpkg.com/pdfjs-dist@5.3.31/cmaps/',
-      cMapPacked: true,
-      // 添加大文件优化配置
-      maxImageSize: fileSizeMB > 50 ? 16777216 : -1, // 16MB图片限制
-      disableFontFace: fileSizeMB > 100, // 大文件禁用字体渲染优化
-      useSystemFonts: fileSizeMB > 100
+      cMapPacked: true
     })
     
     console.log('PDF.js版本:', pdfjsLib.version)
@@ -539,44 +510,163 @@ const loadPdfFromBuffer = async (buffer: ArrayBuffer) => {
     currentPage.value = 1
     pageInput.value = 1
     
+    // 等待DOM更新后再渲染（不影响主要加载流程）
+    await nextTick()
+    try {
+      await renderPage(1)
+    } catch (renderError) {
+      console.warn('首页渲染失败，但不影响PDF加载:', renderError)
+    }
+    
+    // 默认设置为适应宽度模式和启动工具栏自动隐藏（不影响主要加载流程）
+    try {
+      await fitToWidth()
+      startToolbarAutoHide()
+    } catch (uiError) {
+      console.warn('UI初始化失败，但不影响PDF加载:', uiError)
+    }
+    
+    // 默认设置为适应宽度模式和启动工具栏自动隐藏（不影响主要加载流程）
+    try {
+      await fitToWidth()
+      startToolbarAutoHide()
+    } catch (uiError) {
+      console.warn('UI初始化失败，但不影响PDF加载:', uiError)
+    }
+  } catch (error) {
+    console.error('解析PDF失败:', error)
+    console.error('错误详情:', (error as Error).stack)
+    alert('PDF文件解析失败，请检查文件是否损坏')
+  } finally {
+    loading.value = false
+  }
+}
+
+// 使用分片加载器加载PDF
+const loadPdfFromChunkedLoader = async (filePath: string) => {
+  try {
+    loading.value = true
+    console.log('开始分片加载PDF文件:', filePath)
+    
+    // 创建分片加载器
+    const chunkedLoader = new ChunkedPdfLoader(filePath)
+    await chunkedLoader.initialize()
+    
+    // 创建PDFDataRangeTransport
+    const rangeTransport = new pdfjsLib.PDFDataRangeTransport(
+      chunkedLoader.getFileSize(),
+      new Uint8Array(0) // 初始数据
+    )
+    
+    // 请求去重映射和数据缓存
+    const pendingRequests = new Map<string, Promise<void>>()
+    const dataCache = new Map<string, Uint8Array>()
+    
+    // 实现抽象方法requestDataRange
+    rangeTransport.requestDataRange = (begin: number, end: number) => {
+      const requestKey = `${begin}-${end}`
+      
+      // 首先检查数据缓存
+      if (dataCache.has(requestKey)) {
+        console.log(`✓ 缓存命中: ${requestKey}`)
+        const cachedData = dataCache.get(requestKey)!
+        // 立即通知PDF.js数据已准备就绪
+        setTimeout(() => rangeTransport.onDataRange(begin, cachedData), 0)
+        return Promise.resolve()
+      }
+      
+      // 检查是否已有相同请求正在处理
+      if (pendingRequests.has(requestKey)) {
+        console.log(`⏳ 重复请求等待中: ${requestKey}`)
+        return pendingRequests.get(requestKey)!
+      }
+      
+      const length = end - begin
+      console.log(`🔄 新请求: ${begin}-${end} (${length}字节) [活跃: ${pendingRequests.size}]`)
+      
+      const requestPromise = chunkedLoader.getRange(begin, length)
+          .then(data => {
+            console.log(`✅ 完成: ${begin}-${end} (${data.length}字节)`)
+            // 缓存数据
+            dataCache.set(requestKey, data)
+            // 清理过多缓存
+            cleanupCache()
+            // 通知PDF.js数据已准备就绪
+            rangeTransport.onDataRange(begin, data)
+          })
+        .catch(error => {
+          console.error(`❌ 失败: ${begin}-${end}`, error)
+          // 通知PDF.js加载失败
+          rangeTransport.onDataRange(begin, new Uint8Array(0))
+        })
+        .finally(() => {
+          // 清理请求记录
+          pendingRequests.delete(requestKey)
+          console.log(`🧹 清理: ${requestKey} [剩余: ${pendingRequests.size}]`)
+        })
+      
+      pendingRequests.set(requestKey, requestPromise)
+      return requestPromise
+    }
+    
+    // 缓存清理机制 - 限制缓存大小防止内存泄漏
+    const MAX_CACHE_SIZE = 50 // 最多缓存50个数据块
+    const cleanupCache = () => {
+      if (dataCache.size > MAX_CACHE_SIZE) {
+        const keysToDelete = Array.from(dataCache.keys()).slice(0, dataCache.size - MAX_CACHE_SIZE)
+        keysToDelete.forEach(key => {
+          dataCache.delete(key)
+          console.log(`🗑️ 清理缓存: ${key}`)
+        })
+      }
+    }
+    
+    // 配置PDF.js用于分片加载
+    const pdfConfig = {
+      range: rangeTransport,
+      cMapUrl: 'https://unpkg.com/pdfjs-dist@5.3.31/cmaps/',
+      cMapPacked: true,
+      
+      // 分片加载优化配置
+      disableAutoFetch: false, // 允许自动获取，但通过rangeTransport控制
+      disableStream: true, // 禁用流式加载
+      disableRange: false // 启用范围请求
+    }
+    
+    console.log('PDF.js版本:', pdfjsLib.version)
+    console.log('分片加载配置:', pdfConfig)
+    
+    // 创建加载任务
+    const loadingTask = pdfjsLib.getDocument(pdfConfig)
+    console.log('分片LoadingTask创建成功:', loadingTask)
+    
+    // 使用promise方式获取document
+    const pdfDoc = await loadingTask.promise
+    console.log('分片PDF文档加载成功:', pdfDoc)
+    console.log('PDF页数:', pdfDoc.numPages)
+    
+    // 使用 markRaw 防止 PDF 文档被 Vue 响应式代理包装
+    pdfDocument.value = markRaw(pdfDoc)
+    
+    totalPages.value = pdfDocument.value.numPages
+    currentPage.value = 1
+    pageInput.value = 1
+    
     // 等待DOM更新后再渲染
     await nextTick()
     await renderPage(1)
     
-    // 默认适应宽度显示
-    await fitToWidth()
-  } catch (error) {
-    console.error('解析PDF失败:', error)
-    console.error('错误详情:', (error as Error).stack)
-    
-    const errorMessage = error instanceof Error ? error.message : '未知错误'
-    let userMessage = 'PDF文件解析失败'
-    let suggestions = ''
-    
-    // 根据错误类型提供具体建议
-    if (errorMessage.includes('Invalid PDF') || errorMessage.includes('corrupted')) {
-      suggestions = '\n\n可能原因：\n• 文件已损坏或不是有效的PDF文件\n• 文件下载不完整\n• 文件格式不受支持\n\n建议解决方案：\n• 重新下载或获取文件\n• 尝试用其他PDF阅读器打开\n• 检查文件扩展名是否正确'
-    } else if (errorMessage.includes('password') || errorMessage.includes('encrypted')) {
-      suggestions = '\n\n该PDF文件受密码保护，当前版本暂不支持加密文件。\n\n建议解决方案：\n• 使用其他工具移除密码保护\n• 获取未加密版本的文件'
-    } else if (errorMessage.includes('memory') || errorMessage.includes('out of memory') || errorMessage.includes('Invalid array buffer length') || errorMessage.includes('RangeError')) {
-      suggestions = '\n\n内存不足或文件过大，无法解析此PDF文件。\n\n建议解决方案：\n• 关闭其他应用程序释放内存\n• 重启应用程序\n• 使用PDF压缩工具减小文件大小\n• 尝试分割大文件为多个小文件\n• 在64位系统上运行以获得更大内存支持'
-    } else if (errorMessage.includes('文件过大') || errorMessage.includes('超出系统处理能力')) {
-      suggestions = '\n\n文件大小超出系统限制。\n\n建议解决方案：\n• 使用PDF压缩工具减小文件大小\n• 分割PDF为多个较小的文件\n• 在更高配置的设备上打开\n• 使用专业的PDF处理软件'
-    } else {
-      suggestions = '\n\n请检查：\n• 文件是否为有效的PDF格式\n• 文件是否完整未损坏\n• 文件大小是否过大\n• 尝试重新打开文件'
-    }
-    
-    // 使用更友好的错误提示
+    // 默认设置为适应宽度模式和启动工具栏自动隐藏（不影响主要加载流程）
     try {
-      const { message } = await import('@tauri-apps/plugin-dialog')
-      await message(`${userMessage}\n\n错误详情: ${errorMessage}${suggestions}`, {
-        title: 'PDF解析错误',
-        kind: 'error'
-      })
-    } catch (dialogError) {
-      console.error('显示错误对话框失败:', dialogError)
-      alert(`${userMessage}\n\n错误详情: ${errorMessage}${suggestions}`)
+      await fitToWidth()
+      startToolbarAutoHide()
+    } catch (uiError) {
+      console.warn('UI初始化失败，但不影响PDF加载:', uiError)
     }
+  } catch (error) {
+    console.error('分片加载PDF失败:', error)
+    console.error('错误详情:', (error as Error).stack)
+    alert('PDF文件分片加载失败，请检查文件是否损坏')
   } finally {
     loading.value = false
   }
@@ -640,7 +730,7 @@ const renderPage = async (pageNum: number) => {
   } catch (error) {
     console.error('渲染页面失败:', error)
     console.error('错误堆栈:', (error as Error).stack)
-    console.error('错误名称:', (error as Error).name)
+      console.error('错误名称:', (error as Error).name)
     console.error('错误消息:', (error as Error).message)
   } finally {
     loading.value = false
@@ -1004,48 +1094,6 @@ const toggleDarkMode = () => {
   localStorage.setItem('pdf-reader-dark-mode', isDarkMode.value.toString())
 }
 
-// ========== 工具栏自动隐藏功能 ==========
-// 显示工具栏
-const showToolbarTemporarily = () => {
-  showToolbar.value = true
-  resetHideTimer()
-}
-
-// 重置隐藏计时器
-const resetHideTimer = () => {
-  if (toolbarHideTimer.value) {
-    clearTimeout(toolbarHideTimer.value)
-  }
-  
-  // 如果鼠标不在工具栏上，3秒后隐藏工具栏
-  if (!isMouseOverToolbar.value) {
-    toolbarHideTimer.value = setTimeout(() => {
-      showToolbar.value = false
-    }, 3000)
-  }
-}
-
-// 鼠标进入工具栏
-const onToolbarMouseEnter = () => {
-  isMouseOverToolbar.value = true
-  showToolbar.value = true
-  if (toolbarHideTimer.value) {
-    clearTimeout(toolbarHideTimer.value)
-    toolbarHideTimer.value = null
-  }
-}
-
-// 鼠标离开工具栏
-const onToolbarMouseLeave = () => {
-  isMouseOverToolbar.value = false
-  resetHideTimer()
-}
-
-// 鼠标移动时显示工具栏
-const onMouseMove = () => {
-  showToolbarTemporarily()
-}
-
 // ========== 缩略图功能 ==========
 // 切换缩略图面板
 const toggleThumbnails = async () => {
@@ -1058,9 +1106,9 @@ const toggleThumbnails = async () => {
 }
 
 // 设置缩略图canvas引用
-const setThumbnailRef = (el: Element | ComponentPublicInstance | null, pageNum: number) => {
-  if (el && 'getContext' in el) {
-    thumbnailRefs.value.set(pageNum, el as HTMLCanvasElement)
+const setThumbnailRef = (el: any, pageNum: number) => {
+  if (el && el instanceof HTMLCanvasElement) {
+    thumbnailRefs.value.set(pageNum, el)
   }
 }
 
@@ -1385,8 +1433,8 @@ onMounted(() => {
   // 初始化设置
   initializeSettings()
   
-  // 初始化工具栏自动隐藏
-  resetHideTimer()
+  // 启动工具栏自动隐藏
+  startToolbarAutoHide()
 })
 
 // 清理
@@ -1396,11 +1444,36 @@ const cleanup = () => {
   document.removeEventListener('keyup', handleKeyup)
   document.removeEventListener('wheel', handleWheel)
   
-  // 清理工具栏自动隐藏计时器
-  if (toolbarHideTimer.value) {
-    clearTimeout(toolbarHideTimer.value)
-    toolbarHideTimer.value = null
+  // 清理工具栏隐藏定时器
+  if (toolbarHideTimer) {
+    clearTimeout(toolbarHideTimer)
+    toolbarHideTimer = null
   }
+}
+
+// 工具栏自动隐藏相关方法
+const startToolbarAutoHide = () => {
+  // 3秒后自动隐藏工具栏
+  toolbarHideTimer = setTimeout(() => {
+    isToolbarHidden.value = true
+  }, 3000)
+}
+
+const showToolbar = () => {
+  isToolbarHidden.value = false
+  if (toolbarHideTimer) {
+    clearTimeout(toolbarHideTimer)
+    toolbarHideTimer = null
+  }
+  // 重新启动自动隐藏定时器
+  startToolbarAutoHide()
+}
+
+const startHideToolbar = () => {
+  // 鼠标离开工具栏后2秒隐藏
+  toolbarHideTimer = setTimeout(() => {
+    isToolbarHidden.value = true
+  }, 2000)
 }
 
 // 初始化设置
@@ -1420,6 +1493,33 @@ const initializeSettings = () => {
 
 // 检查是否有需要打开的PDF文件
 const checkPdfToOpen = async () => {
+  // 首先检查是否有HTML5文件对象
+  const pdfFileObject = sessionStorage.getItem('pdf-file-object')
+  if (pdfFileObject && (window as any).tempPdfFile) {
+    try {
+      const fileInfo = JSON.parse(pdfFileObject)
+      const file = (window as any).tempPdfFile
+      console.log('检测到HTML5文件对象:', fileInfo)
+      
+      fileName.value = file.name
+      const arrayBuffer = await file.arrayBuffer()
+      await loadPdfFromBuffer(arrayBuffer)
+      
+      // 清理临时数据
+      sessionStorage.removeItem('pdf-file-object')
+      delete (window as any).tempPdfFile
+      
+      console.log('HTML5文件加载成功')
+      return
+    } catch (error) {
+      console.error('加载HTML5文件失败:', error)
+      // 清理临时数据
+      sessionStorage.removeItem('pdf-file-object')
+      delete (window as any).tempPdfFile
+    }
+  }
+  
+  // 检查是否有文件路径
   const pdfToOpen = sessionStorage.getItem('pdf-to-open')
   console.log('检查是否有需要打开的PDF文件:', pdfToOpen)
   
@@ -1433,6 +1533,7 @@ const checkPdfToOpen = async () => {
         
         // 检查文件是否存在
         try {
+          const { exists } = await import('@tauri-apps/plugin-fs')
           const fileExists = await exists(pdfInfo.filePath)
           console.log('文件是否存在检查结果:', fileExists, '路径:', pdfInfo.filePath)
           
@@ -1448,9 +1549,6 @@ const checkPdfToOpen = async () => {
             await renderPage(pdfInfo.currentPage)
             console.log('渲染到指定页面成功:', pdfInfo.currentPage)
           }
-          
-          // 默认适应宽度显示
-          await fitToWidth()
         } catch (loadError) {
           console.error('加载PDF文件失败:', loadError)
           console.error('错误详情:', (loadError as Error).stack)
@@ -1482,7 +1580,7 @@ const checkPdfToOpen = async () => {
 
 // 更新阅读历史
 const updateReadingHistory = (pageNum: number) => {
-  if (!pdfDocument.value || !fileName.value) return
+  if (!pdfDocument.value || !filePath.value) return
   
   try {
     // 从本地存储获取现有的阅读历史
@@ -1490,24 +1588,23 @@ const updateReadingHistory = (pageNum: number) => {
     let history = saved ? JSON.parse(saved) : []
     
     // 查找当前文件是否已在历史记录中
-    const filePath = fileName.value
-    const existingIndex = history.findIndex((item: any) => item.filePath === filePath)
+    const currentFilePath = filePath.value
+    const existingIndex = history.findIndex((item: any) => item.filePath === currentFilePath)
     
     const historyItem = {
-      title: filePath.split(/[\\/]/).pop() || filePath,
-      filePath: filePath,
+      title: currentFilePath.split(/[\/]/).pop() || currentFilePath,
+      filePath: currentFilePath,
       currentPage: pageNum,
       totalPages: totalPages.value,
       lastRead: new Date().toISOString()
     }
     
     if (existingIndex !== -1) {
-      // 更新现有记录
-      history[existingIndex] = historyItem
-    } else {
-      // 添加新记录
-      history.unshift(historyItem)
+      // 移除现有记录
+      history.splice(existingIndex, 1)
     }
+    // 将记录添加到最前面（无论是新记录还是更新的记录）
+    history.unshift(historyItem)
     
     // 限制历史记录数量为20条
     if (history.length > 20) {
@@ -1546,7 +1643,7 @@ onUnmounted(cleanup)
   left: 0;
   right: 0;
   z-index: 1000;
-  transition: transform 0.3s ease-in-out;
+  transition: transform 0.3s ease;
 }
 
 .toolbar-hidden {
@@ -1697,21 +1794,7 @@ onUnmounted(cleanup)
 .loading-state h3 {
   margin: 12px 0 8px 0;
   font-size: 18px;
-}
-
-.loading-tips {
-  margin-top: 16px;
-  padding: 12px;
-  background: rgba(0, 123, 255, 0.1);
-  border-radius: 8px;
-  border-left: 3px solid #007bff;
-}
-
-.tip-text {
-  margin: 4px 0;
-  font-size: 13px;
-  color: #555;
-  line-height: 1.4;
+  color: #333;
 }
 
 .loading-state p {

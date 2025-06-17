@@ -80,7 +80,6 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { exists } from '@tauri-apps/plugin-fs'
 
 // 定义阅读历史项的类型
 interface ReadingHistoryItem {
@@ -126,7 +125,7 @@ const loadReadingHistory = () => {
       readingHistory.value = historyData.map((item: any) => ({
         ...item,
         lastRead: new Date(item.lastRead)
-      }))
+      })).sort((a: ReadingHistoryItem, b: ReadingHistoryItem) => b.lastRead.getTime() - a.lastRead.getTime()) // 按最新时间排序
     }
   } catch (error) {
     console.error('加载阅读历史失败:', error)
@@ -148,10 +147,10 @@ const removeHistoryItem = (index: number) => {
   saveReadingHistory()
 }
 
-// 打开PDF阅读器
+// 打开PDF阅读器 - 直接调用文件选择对话框
 const openPdfViewer = async () => {
   try {
-    // 使用Tauri的文件对话框直接选择文件
+    // 使用Tauri的文件对话框
     const { invoke } = await import('@tauri-apps/api/core')
     const filePath = await invoke('open_file_dialog')
     
@@ -162,25 +161,37 @@ const openPdfViewer = async () => {
         currentPage: 1
       }))
       
-      console.log('已将PDF信息存储到sessionStorage:', filePath)
+      console.log('已选择文件，准备跳转到阅读器:', filePath)
       
       // 导航到PDF阅读器页面
       window.location.href = '#/viewer'
     }
   } catch (error) {
     console.error('打开文件对话框失败:', error)
-    // 使用Tauri的对话框插件显示错误
-    try {
-      const { message } = await import('@tauri-apps/plugin-dialog')
-      await message(`无法打开文件选择对话框\n\n错误信息: ${(error as Error).message || '未知错误'}`, {
-        title: '文件选择错误',
-        kind: 'error'
-      })
-    } catch (dialogError) {
-      console.error('显示错误对话框失败:', dialogError)
-      // 使用浏览器原生alert作为备选
-      alert(`无法打开文件选择对话框\n\n错误信息: ${(error as Error).message || '未知错误'}`)
+    
+    // 如果Tauri方法失败，使用HTML5文件输入作为备选
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = '.pdf'
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0]
+      if (file) {
+        // 对于HTML5文件选择，我们需要将文件内容转换为可用的格式
+        // 这里我们直接跳转到阅读器，让阅读器处理文件
+        sessionStorage.setItem('pdf-file-object', JSON.stringify({
+          name: file.name,
+          size: file.size,
+          type: file.type
+        }))
+        
+        // 将文件对象存储到一个临时的全局变量中
+        ;(window as any).tempPdfFile = file
+        
+        console.log('已选择HTML5文件，准备跳转到阅读器:', file.name)
+        window.location.href = '#/viewer'
+      }
     }
+    input.click()
   }
 }
 
@@ -194,6 +205,7 @@ const openPdf = async (item: ReadingHistoryItem) => {
     console.log('规范化前的文件路径:', normalizedPath)
     
     // 使用Tauri API检查文件是否存在
+    const { exists } = await import('@tauri-apps/plugin-fs')
     
     // 检查文件是否存在
     const fileExists = await exists(normalizedPath)
@@ -203,34 +215,34 @@ const openPdf = async (item: ReadingHistoryItem) => {
       throw new Error(`文件不存在: ${normalizedPath}`)
     }
     
-    // 将选中的PDF信息存储到sessionStorage，以便PDF阅读器组件可以获取
+    // 文件存在，将选中的PDF信息存储到sessionStorage
     sessionStorage.setItem('pdf-to-open', JSON.stringify({
       filePath: normalizedPath,
       currentPage: item.currentPage
     }))
     
-    console.log('已将PDF信息存储到sessionStorage')
+    console.log('已将PDF信息存储到sessionStorage，准备跳转到阅读器')
     
     // 导航到PDF阅读器页面
     window.location.href = '#/viewer'
+    
   } catch (error) {
     console.error('打开PDF文件失败:', error)
     console.error('错误详情:', (error as Error).stack)
     
-    // 文件打开失败时，保持在历史记录页面，不跳转
-    // 使用Tauri的对话框插件显示错误
+    // 在阅读历史界面显示错误提示，不跳转页面
     try {
       const { message } = await import('@tauri-apps/plugin-dialog')
-      await message(`无法打开文件: ${item.filePath}\n\n错误信息: ${(error as Error).message || '未知错误'}\n\n请检查文件是否存在或已被移动。`, {
+      await message(`无法打开文件: ${item.filePath}\n\n错误信息: ${(error as Error).message || '未知错误'}`, {
         title: '文件打开错误',
         kind: 'error'
       })
     } catch (dialogError) {
       console.error('显示错误对话框失败:', dialogError)
       // 使用浏览器原生alert作为备选
-      alert(`无法打开文件: ${item.filePath}\n\n错误信息: ${(error as Error).message || '未知错误'}\n\n请检查文件是否存在或已被移动。`)
+      alert(`无法打开文件: ${item.filePath}\n\n错误信息: ${(error as Error).message || '未知错误'}`)
     }
-    // 不执行跳转，保持在当前页面
+    // 不跳转页面，保持在阅读历史界面
   }
 }
 
@@ -264,41 +276,12 @@ onMounted(() => {
   margin: 0 auto;
   min-height: 100vh;
   max-height: 100vh;
-  overflow-y: auto;
   background-color: #f5f5f5;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   color: #333;
   transition: background-color 0.3s, color 0.3s;
-}
-
-/* 自定义滚动条样式 */
-.reading-history::-webkit-scrollbar {
-  width: 8px;
-}
-
-.reading-history::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 4px;
-}
-
-.reading-history::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.3);
-  border-radius: 4px;
-}
-
-.reading-history::-webkit-scrollbar-thumb:hover {
-  background: rgba(0, 0, 0, 0.5);
-}
-
-.dark-mode .reading-history::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.dark-mode .reading-history::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.3);
-}
-
-.dark-mode .reading-history::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.5);
 }
 
 .reading-history.dark-mode {
@@ -351,6 +334,39 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
+  overflow-y: auto;
+  flex: 1;
+  padding-right: 0.5rem;
+}
+
+.history-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.history-list::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+.history-list::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+.history-list::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}
+
+.dark-mode .history-list::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+.dark-mode .history-list::-webkit-scrollbar-thumb {
+  background: #555;
+}
+
+.dark-mode .history-list::-webkit-scrollbar-thumb:hover {
+  background: #777;
 }
 
 .history-item {
